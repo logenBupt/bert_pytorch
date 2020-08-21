@@ -22,15 +22,6 @@ class BertDenseLN(nn.Module):
             self.bert = XLMRobertaModel(config)
         else:
             raise KeyError(f"{type} is not a valid type!")
-        self.embeddingHead = nn.Linear(config.hidden_size, outdim)
-        self.norm = nn.LayerNorm(outdim)
-        self.activation = nn.Tanh()
-        if use_xavier:
-            nn.init.xavier_uniform_(self.embeddingHead.weight)
-        else:
-            self.embeddingHead.weight.data.normal_(mean=0.0, std=0.02)
-        self.embeddingHead.bias.data.fill_(0.0)
-        self.emb_dropout = nn.Dropout(p=p_dropout)
 
     def extend_position_embedding(self, max_position):
         """This function extends the position embedding weights of a model loaded from a checkpoint.
@@ -102,22 +93,9 @@ class BertDenseLN(nn.Module):
         self.replace_model_self_attention_with_sparse_self_attention(max_position, sparsity_config)
 
 
-    def forward(self, input_ids, attention_mask, use_cls, compress, use_tanh, normalize=True):
-        outputs1 = self.bert(input_ids=input_ids,
-                            attention_mask=attention_mask)
-        if use_cls:
-            first_token = outputs1[0][:,0]
-        else:
-            # use pooled first token
-            first_token = outputs1[1]
-        first_token = self.emb_dropout(first_token)       
-        if compress:
-            first_token = self.embeddingHead(first_token)
-        if use_tanh:
-            first_token = self.activation(first_token)
-        if normalize:
-            first_token = F.normalize(first_token, p=2, dim=1)
-        return first_token
+    def forward(self, input_ids, attention_mask):
+        output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        return output[1]
 
 class L1TrainModel(BertPreTrainedModel):
     def __init__(self, config, model_argobj):
@@ -197,76 +175,126 @@ class L1TrainModel(BertPreTrainedModel):
         acc = torch.eq(preds, labels.int()).float().mean()
         return loss, eval_logits, acc, q_embs, body_embs
 
+
+class Compression(nn.Module):
+    def __init__(self, in_size, out_size):
+        super().__init__()
+        self.branch_0 = nn.Linear(in_size, out_size)
+        self.branch_1 = nn.Linear(in_size, out_size)
+
+        nn.init.xavier_uniform_(self.branch_0.weight)
+        nn.init.xavier_uniform_(self.branch_1.weight)
+        self.branch_0.bias.data.zero_()
+        self.branch_1.bias.data.zero_()
+
+    def forward(self, inputs):
+        return torch.tanh(self.branch_0(inputs) + self.branch_1(inputs))
+
+
 class L1_Original(BertPreTrainedModel):
     def __init__(self, config, model_argobj):
         super().__init__(config)
+        self.args = model_argobj
         self.q_encoder = BertDenseLN(config, 768, num_hidden_layers=3, use_xavier=False, p_dropout=0.1)
         self.body_encoder = BertDenseLN(config, 768, num_hidden_layers=3, use_xavier=False, p_dropout=0.1)
         if model_argobj.enable_sparse_transformer:
             self.body_encoder.update_to_sparse_transformer(model_argobj.max_position, FixedSparsityConfig(model_argobj.num_heads, model_argobj.seq_len))
         self.q_encoder.bert.embeddings.word_embeddings = self.body_encoder.bert.embeddings.word_embeddings
-        # self.w = torch.nn.Parameter(torch.ones(1)*10.0)
-        # self.b = torch.nn.Parameter(torch.zeros(1))
-        self.w = 10.0
-        self.b = -5.0
-        self.m_sample = 2
-        self.bce_logit_loss = nn.BCEWithLogitsLoss(pos_weight=torch.full([1], self.m_sample, dtype=torch.float32), reduction='none')
+        self.sim_weight = 10.0
+        self.sim_bias = -5.0
+        # self.bce_logit_loss = nn.BCEWithLogitsLoss(pos_weight=torch.full([1], self.m_sample, dtype=torch.float32), reduction='none')
+        self.bce_logit_loss = nn.BCEWithLogitsLoss(reduction='none')
+
+        if args.use_MLP:
+            self.query_mlp = Compression(
+                config.hidden_size, args.compressor_dim)
+            self.meta_mlp = Compression(
+                config.hidden_size, args.compressor_dim)
 
     def query_emb(self, input_ids, attention_mask):
-        print("query input_ids: ", input_ids.size())
-        print("query attention_mask: ", attention_mask.size())
-        q_embs_norm = self.q_encoder(input_ids, attention_mask, use_cls=True, compress=False, use_tanh=False, normalize=True)
-        print("query embs norm: ", q_embs_norm.size())
+        q_embs_norm = self.q_encoder(input_ids, attention_mask)
+        if self.args.use_MLP:
+            return self.query_mlp(q_embs_norm)
         return q_embs_norm
 
     def body_emb(self, input_ids, attention_mask):
-        print("body input_ids: ", input_ids.size())
-        print("body attention_mask: ", attention_mask.size())
-        print("body part config: ", self.body_encoder.bert.config)
-        print("body part position_embeddings: ", self.body_encoder.bert.embeddings.position_embeddings)
-        print("body part position_embeddings weight shape: ", self.body_encoder.bert.embeddings.position_embeddings.weight.data.size())
-        body_embs_norm = self.body_encoder(input_ids, attention_mask, use_cls=True, compress=False, use_tanh=False, normalize=True)
-        print("body embs norm: ", body_embs_norm.size())
+        body_embs_norm = self.body_encoder(input_ids, attention_mask)
+        if self.args.use_MLP:
+            return self.query_mlp(body_embs_norm)
         return body_embs_norm
     
     def forward(self, query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels):
         labels = labels.float()
-        body_embs_norm = self.body_emb(meta_ids, meta_attn_mask)
-        q_embs_norm = self.query_emb(query_ids, query_attn_mask)
+        if not self.training:
+            return self.eval_forward(query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels)
+        
+        batch_size = query_ids.size(0)
+        query_vectors = self.query_emb(query_ids, query_attn_mask)
+        meta_vectors = self.body_emb(meta_ids, meta_attn_mask)
 
-        x_q_sim = torch.matmul(q_embs_norm, q_embs_norm.t())
-        x_q_mask = torch.where(x_q_sim>=0.9, -1e12*torch.ones_like(x_q_sim), torch.zeros_like(x_q_sim))
+        query_l2 = F.normalize(query_vectors, p=2, dim=-1)
+        query_sim = torch.matmul(query_l2, query_l2.T)
+        # query_mask = torch.where(torch.gt(query_sim, 0.90),
+        #                                  -1e12 * torch.ones_like(query_sim), torch.zeros_like(query_sim))
+        query_mask = (query_sim >= 0.9).float() * -1e12
+        # torch.where(condition, x, y) == x if conditon else y
+        
+        query_vectors = F.dropout(query_vectors, p=0.1, training=self.training)
+        meta_vectors = F.dropout(meta_vectors, p=0.1, training=self.training)
 
-        eval_sim = (q_embs_norm*body_embs_norm).sum(-1)
-        eval_logits = self.w*eval_sim+self.b
-        eval_loss = self.bce_logit_loss(eval_logits, labels).mean()
-        # eval_loss = self.bce_loss(eval_sim, labels).mean()
-        loss = eval_loss
+        src_norm = F.normalize(query_vectors, p=2, dim=-1)
+        trg_norm = F.normalize(meta_vectors, p=2, dim=-1)
 
-        if self.training:
-            x_sim = torch.matmul(q_embs_norm, body_embs_norm.t())
-            x_sim_masked = x_sim + x_q_mask + -1e12*torch.eye(x_sim.shape[0]).to(x_sim.device) # self-mask + mask queries that are too similar
-            
-            #nce_topk_idx = torch.argmax(x_sim_masked, dim=1).detach()
-            nce_topk_idx = torch.topk(x_sim_masked, x_sim_masked.shape[-1])[1].detach()[:, :self.m_sample]
-            neg_embs = body_embs_norm[nce_topk_idx].reshape(-1, body_embs_norm.shape[-1])
-            assert len(neg_embs.shape)==2
-            assert neg_embs.shape[0] == body_embs_norm.shape[0]*self.m_sample
-            repeated_q_embs = torch.repeat_interleave(q_embs_norm, self.m_sample, dim=0)
-            nce_sim = (repeated_q_embs*neg_embs).sum(-1)
-            nce_labels = torch.zeros_like(labels).to(nce_sim.device).float().repeat_interleave(self.m_sample)
-            nce_logits = self.w*nce_sim+self.b
-            # nce_weight = self.m_sample*1.0/(self.m_sample+1.0)
-            nce_weight = 0.5
-            # assert len(nce_logits.shape)==1
-            nce_loss = self.bce_logit_loss(nce_logits, nce_labels).mean()
-            # nce_loss = self.bce_loss(nce_sim, nce_labels).mean()
-            loss = nce_weight*nce_loss + (1.0-nce_weight)*eval_loss
+        cross_sim = torch.matmul(src_norm, trg_norm.T)
+        cross_sim_masked = query_mask + -1e12 * torch.eye(batch_size).to(cross_sim.device) + cross_sim  # query_mask already contains torch.eye item
+        max_neg_idx = torch.argmax(cross_sim_masked, dim=1).detach()
 
-        preds = (eval_logits>0).int()
-        acc = torch.eq(preds, labels.int()).float().mean()  
+        neg_encoded_trg_norm = trg_norm[max_neg_idx]
+        src_norm_concat = torch.cat([src_norm, src_norm], dim=0)
+        trg_norm_concat = torch.cat([trg_norm, neg_encoded_trg_norm], dim=0)
+        t_labels = torch.cat((labels, torch.zeros_like(labels))).float()
 
-        return loss, eval_logits, acc, q_embs_norm, body_embs_norm
+        t_sim = (src_norm_concat * trg_norm_concat).sum(-1)
+        t_logits = self.sim_weight * t_sim + self.sim_bias
+
+        per_sample_loss = self.bce_loss(t_logits, t_labels)
+        eval_loss = per_sample_loss[:batch_size].mean()
+        nce_loss = per_sample_loss[batch_size:].mean()
+        loss = self.args.nce_weight * nce_loss + (1.0 - self.args.nce_weight) * eval_loss
+        eval_sim = t_sim[:batch_size]
+        nce_sim = t_sim[batch_size:]
+
+        preds = (eval_sim >= 0.5).int()
+        acc = torch.eq(preds, labels.int()).float().mean()
+
+        label_0_sim = eval_sim[torch.eq(labels.int(), 0)]
+        label_1_sim = eval_sim[torch.eq(labels.int(), 1)]
+        label_2_sim = eval_sim[torch.eq(labels.int(), 2)]
+        label_3_sim = eval_sim[torch.eq(labels.int(), 3)]
+        label_4_sim = eval_sim[torch.eq(labels.int(), 4)]
+        label_5_sim = eval_sim[torch.eq(labels.int(), 5)]
+
+        # return loss, eval_loss, nce_loss, query_vectors, meta_vectors, eval_sim, nce_sim
+        return {"total_loss": loss, "eval_loss": (1.0 - self.args.nce_weight) * eval_loss, "nce_loss": self.args.nce_weight * nce_loss}, \
+            {"eval": eval_sim, "nce": nce_sim, "label_0": label_0_sim, "label_1": label_1_sim, "label_2": label_2_sim, "label_3": label_3_sim, "label_4": label_4_sim, "label_5": label_5_sim}, \
+                acc, query_vectors, meta_vectors
+
+    def eval_forward(self, query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels):
+        query_vectors = self.query_embs(query_ids, query_attn_mask)
+        meta_vectors = self.meta_embs(meta_ids, meta_attn_mask)
+
+        src_norm = F.normalize(query_vectors, p=2, dim=-1)
+        trg_norm = F.normalize(meta_vectors, p=2, dim=-1)
+        eval_sim = (src_norm * trg_norm).sum(-1)
+
+        eval_logits = self.sim_weight * eval_sim + self.sim_bias
+    
+        loss = self.bce_loss(eval_logits, labels.float()).mean()
+        
+        preds = (eval_sim >= 0.5).int()
+        acc = torch.eq(preds, labels.int()).float().mean()
+        return {"total_loss": loss}, {"eval": eval_sim}, acc, query_vectors, meta_vectors
+
 
 class L1_Orig_CLS(L1_Original):
     def __init__(self, config, model_argobj):

@@ -24,7 +24,7 @@ default_chunk_cfg = [[("query", "market"), (20, 5)], [("title", "anchor", "url",
 UTMB_Short_chunk_cfg = [[("query",), (20,)], [("url", "title", "desc", "cleanbody"),(20, 20, 50, 100)],]
 UTMB_chunk_cfg = [[("query", "market"), (20,5)], [("title", "url", "desc", "cleanbody"),(20, 20, 50, 300)],]
 
-Body_chunk_cfg = [[("query",), (20,)], [("cleanbody",), (2047,)]]
+Body_chunk_cfg = [[("query",), (20,)], [("cleanbody",), (1023,)]]
 
 train_schema_AUTCMLB = {"label": 0, "query" : 3, "title": 4, "anchor" : 5, "url" : 6, "click" : 7, "desc" : 8, "cleanbody" : 9, "market" : 10, "lang" : 11}
 eval_schema_AUTCMLB = {"qid" : 0, "docid" : 1, "query" : 4, "title" : 5, "anchor": 6, "url" : 7, "click" : 8, "desc" : 9, "rating" : 10, "cleanbody" : 11, "market" : 12, "lang" : 13}
@@ -143,6 +143,9 @@ def load_model_config(model_type, args):
     model_args.enable_sparse_transformer = args.enable_sparse_transformer
     model_args.num_heads = args.num_heads
     model_args.seq_len = args.seq_len
+    model_args.use_MLP = False
+    model_args.compressor_dim = 64
+    model_args.nce_weight = 0.9
 
     # use default cache directory to avoid double downloading of the pretrained checkpoints
     config = configObj.config_class.from_pretrained(

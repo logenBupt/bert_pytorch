@@ -31,6 +31,8 @@ from L1.config import L1ConfigDict, wrapped_process_fn, load_model_config
 from L1.L1_eval import eval_fidelity
 from util import LineShuffler
 
+from datetime import datetime
+from time import time
 from transformers import (
     WEIGHTS_NAME,
     AdamW,
@@ -72,7 +74,7 @@ except ImportError:
 from sklearn.metrics import roc_curve, auc
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+
 
 def getattr_recursive(obj, name):
     for layer in name.split("."):
@@ -82,6 +84,22 @@ def getattr_recursive(obj, name):
             return None
     return obj
 
+def set_logger(log_path, args):
+    logger = logging.getLogger('driver.py')
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.DEBUG)
+    # create console handler with a higher log level
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
+    )
+    formatter = logging.Formatter(fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt="%m/%d/%Y %H:%M:%S")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    return logger
+
 # --------------------------------------------------------------------------
 def set_seed(args):
     random.seed(args.seed)
@@ -90,7 +108,7 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-def save_checkpoint(args, global_step, model, tokenizer, optimizer=None, scheduler=None):
+def save_checkpoint(args, global_step, model, tokenizer, optimizer=None, scheduler=None, logger=None):
     # Save model checkpoint
     if global_step<0:
         output_dir = args.output_dir
@@ -102,10 +120,16 @@ def save_checkpoint(args, global_step, model, tokenizer, optimizer=None, schedul
         model.module if hasattr(model, "module") else model
     )  # Take care of distributed/parallel training
     model_to_save.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
+    try:
+        tokenizer.save_pretrained(output_dir)
+    except Exception:
+        pass
 
     torch.save(args, os.path.join(output_dir, "training_args.bin"))
-    logger.info("Saving model checkpoint to %s", output_dir)
+    if logger:
+        logger.info("Saving model checkpoint to %s", output_dir)
+    else:
+        print("Saving model checkpoint to %s", output_dir)
 
     if optimizer is not None:
         torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
@@ -113,7 +137,7 @@ def save_checkpoint(args, global_step, model, tokenizer, optimizer=None, schedul
         torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
 
 
-def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
+def train(args, model, tokenizer, shuffled_fh, train_fn, configObj, logger):
     """ Train the model """
     #if args.local_rank in [-1, 0]:
     tb_writer = None
@@ -123,11 +147,17 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     real_batch_size = args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1)
 
+    total_train_steps = len(shuffled_fh) * args.num_train_epochs // real_batch_size
+    if args.warmup_steps <= 0:
+        args.warmup_steps = int(total_train_steps * args.warmup_proportion)
+
     if args.max_steps > 0:
         t_total = args.max_steps
         #args.num_train_epochs = args.max_steps // (args.expected_train_size // args.gradient_accumulation_steps) + 1 
     else:
-        t_total = args.expected_train_size // real_batch_size * args.num_train_epochs    
+        # t_total = args.expected_train_size // real_batch_size * args.num_train_epochs    
+        t_total = total_train_steps
+        args.max_steps = total_train_steps
 
     # layerwise optimization for lamb
     optimizer_grouped_parameters = []
@@ -139,22 +169,21 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
             optimizer_grouped_parameters.append({"params": layer.parameters()})
             for p in layer.parameters():
                 layer_optim_params.add(p)
+
     if getattr_recursive(model, "bert.encoder.layer") is not None:
         for layer in model.bert.encoder.layer:
             optimizer_grouped_parameters.append({"params": layer.parameters()})
             for p in layer.parameters():
                 layer_optim_params.add(p)
     optimizer_grouped_parameters.append({"params": [p for p in model.parameters() if p not in layer_optim_params]})
+    
     if len(optimizer_grouped_parameters)==0:
         
         optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": 0.01,
-        },
-        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+            {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], "weight_decay": 0.01},
+            {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0}
         ]
-    print("Optimizer param groups:", len(optimizer_grouped_parameters))   
+    logger.info("len(optimizer_grouped_parameters): {}".format(len(optimizer_grouped_parameters)))  # 1
 
     if args.optimizer.lower()=="lamb":
         optimizer = Lamb(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
@@ -203,17 +232,13 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
 
     # Train!
     logger.info("***** Running training *****")
-    #logger.info("  Num examples = %d", len(train_dataset))
-    logger.info("  Num Epochs = %d", args.num_train_epochs)
-    logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
-    logger.info(
-        "  Total train batch size (w. parallel, distributed & accumulation) = %d",
-        args.train_batch_size
-        * args.gradient_accumulation_steps
-        * (torch.distributed.get_world_size() if args.local_rank != -1 else 1),
-    )
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    logger.info("  Total optimization steps = %d", t_total)
+    logger.info("   Train dataset size = %d", len(shuffled_fh))
+    logger.info("   Num Epochs = %d", args.num_train_epochs)
+    logger.info("   Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
+    logger.info("   Total train batch size (w. parallel, distributed & accumulation) = %d", real_batch_size)
+    logger.info("   Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+    logger.info("   Total optimization steps = %d", t_total)
+    logger.info("   LR warmup steps = %d", args.warmup_steps)
 
     global_step = 0
     eval_cnt = 0
@@ -231,14 +256,16 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
             epochs_trained = global_step // (args.expected_train_size // args.gradient_accumulation_steps)
             steps_trained_in_current_epoch = global_step % (args.expected_train_size // args.gradient_accumulation_steps)
 
-            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
-            logger.info("  Continuing training from epoch %d", epochs_trained)
-            logger.info("  Continuing training from global step %d", global_step)
-            logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
+            logger.info("   Continuing training from checkpoint, will skip to saved global_step")
+            logger.info("   Continuing training from epoch %d", epochs_trained)
+            logger.info("   Continuing training from global step %d", global_step)
+            logger.info("   Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
         except:
             logger.info("  Start training from a pretrained model") 
 
-    tr_loss, logging_loss = 0.0, 0.0
+    tr_loss = 0.0
+
+    tensorboard_scalars = {}
     model.zero_grad()
 
     eval_cfg = args.eval_configObj # this is also produced in the load_model_config() method
@@ -247,25 +274,28 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
     ideal_path = args.eval_ideal_path
     is_first_eval = (eval_cnt == 0)
 
-    train_iterator = trange(
-        epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0],
-    )
     best_checkpoints = []
     set_seed(args)  # Added here for reproductibility
+
+    train_iterator = trange(
+        epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
+    )
     for m_epoch in train_iterator:
         # shuffle input after first epoch
         if m_epoch>0:
             shuffled_fh.change_seed(m_epoch)
         sds = SimplifiedStreamingDataset(shuffled_fh, train_fn, configObj.ix_func)
-        train_dataloader = DataLoader(sds, batch_size=args.per_gpu_train_batch_size, num_workers=1)
+        train_dataloader = DataLoader(sds, batch_size=args.per_gpu_train_batch_size, num_workers=4)
         acc_accum = []
+        model.train()
         for step, batch in tqdm(enumerate(train_dataloader), desc="Iteration", disable=args.local_rank not in [-1, 0]):
+            if step % 100 == 0:
+                logger.info('train_step: {}'.format(step))
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
                 steps_trained_in_current_epoch -= 1
                 continue
           
-            model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {"query_ids": batch[0].long(), "query_attn_mask": batch[1].long(), 
                         "meta_ids": batch[3].long(), "meta_attn_mask": batch[4].long(),
@@ -278,11 +308,13 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
                 with model.no_sync():
                     outputs = model(**inputs)
                     
-            loss = outputs[0]
+            loss_combine = outputs[0]
+            assert len(loss_combine) == 3
+            loss = loss_combine["total_loss"]
+            sim_combine = outputs[1]
+            assert len(sim_combine) == 8
             acc = outputs[2]
-            q_embs, body_embs = outputs[3], outputs[4]
             acc_accum.append(acc.item())
-            labels = inputs["labels"].cpu().numpy().squeeze()
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -297,9 +329,14 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
                     loss.backward()
                 else:
                     with model.no_sync():
-                        loss.backward()          
-
+                        loss.backward()
             tr_loss += loss.item()
+
+            for key, value in loss_combine.items():
+                tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value
+            for key, value in sim_combine.items():
+                tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value.mean()
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -312,57 +349,53 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
                 global_step += 1
 
                 if args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    logs = {}
-
                     if args.evaluate_during_training and global_step % (args.logging_steps_per_eval*args.logging_steps)==0:
                         if is_first_worker():
-                            save_checkpoint(args, -1, model, tokenizer)
+                            save_checkpoint(args, -1, model, tokenizer, logger=logger)
 
-                        print("Train acc:", sum(acc_accum)*1.0/len(acc_accum))
+                        logger.info("Train acc: {}".format(sum(acc_accum)*1.0/len(acc_accum)))                        
                         
                         model.eval()
                         is_first_eval = (eval_cnt == 0)
                         args.global_step = global_step
-                        fidelity = eval_fidelity(args, model, eval_fn, eval_cfg.path, ideal_path, args.cache_dir, is_first_eval, args.eval_full)
+                        init_time = time()
+                        fidelity = eval_fidelity(args, model, eval_fn, eval_cfg.path, ideal_path, args.cache_dir, is_first_eval, args.eval_full, logger)
+                        logger.info("Eval cost time: {}".format(time() - init_time))
                         eval_cnt+=1
+
+                        model.train()
 
                         if is_first_worker():
                             if len(best_checkpoints)<3:
-                                save_checkpoint(args, global_step, model, tokenizer, optimizer, scheduler)
+                                save_checkpoint(args, global_step, model, tokenizer, optimizer, scheduler, logger=logger)
                                 best_checkpoints.append((global_step, fidelity))
                             else:
                                 worst_checkpoint = sorted(best_checkpoints, key=lambda x: x[1])[0]
                                 if fidelity>worst_checkpoint[1]:
-                                    save_checkpoint(args, global_step, model, tokenizer, optimizer, scheduler)
+                                    save_checkpoint(args, global_step, model, tokenizer, optimizer, scheduler, logger=logger)
                                     worst_cp_path = os.path.join(args.output_dir, "checkpoint-{}".format(str(worst_checkpoint[0])))
                                     shutil.rmtree(worst_cp_path)
                                     best_checkpoints.remove(worst_checkpoint)
                                     best_checkpoints.append((global_step, fidelity))
                                 else:
-                                    print("Fidelity not in top 3!")
+                                    logger.info("Fidelity not in top 3!")
                                 assert len(best_checkpoints)==3
+                            tb_writer.add_scalar("fidelity", fidelity, global_step)
 
                             
-                            print("Fidelity: {0}".format(fidelity))
-                            logs["fidelity"] = fidelity
+                            logger.info("Fidelity: {0}".format(fidelity))
                         dist.barrier()
 
-                    loss_scalar = (tr_loss - logging_loss) / args.logging_steps
                     learning_rate_scalar = scheduler.get_lr()[0]
-                    logs["learning_rate"] = learning_rate_scalar
-                    logs["loss"] = loss_scalar
-                    logging_loss = tr_loss
 
                     if is_first_worker():
-                        for key, value in logs.items():
-                            print(key, type(value))
-                            if isinstance(value, dict):
-                                tb_writer.add_scalars(key, value, global_step)
-                            else:
-                                tb_writer.add_scalar(key, value, global_step)
+                        tb_writer.add_scalar("learning_rate", learning_rate_scalar, global_step)
                         tb_writer.add_scalar("epoch", m_epoch, global_step)
-                        print(json.dumps({**logs, **{"step": global_step}}))
+                        for key, value in tensorboard_scalars.items():
+                            tb_writer.add_scalar(key, value / args.logging_steps, global_step)
+                        logger.info(json.dumps({**tensorboard_scalars, **{"step": global_step}}))
                     
+                    tensorboard_scalars = {}
                     dist.barrier()
 
         if args.max_steps > 0 and global_step > args.max_steps:
@@ -376,11 +409,7 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj):
 
 
 def is_first_worker():
-    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-        logger.info("Is the first worker")
-        return True
-    logger.info("Not the first worker")
-    return False
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 def main():
     parser = argparse.ArgumentParser()
@@ -440,7 +469,7 @@ def main():
         "--evaluate_during_training", action="store_true", help="Rul evaluation during training at each logging step.",
     )
     parser.add_argument(
-        "--do_lower_case", action="store_true", help="Set this flag if you are using an uncased model.",
+        "--do_lower_case", action="store_false", help="Set this flag if you are using an uncased model.",
     )
     parser.add_argument(
         "--log_dir",
@@ -489,6 +518,9 @@ def main():
         help="If > 0: set total number of training steps to perform. Override num_train_epochs.",
     )
     parser.add_argument("--warmup_steps", default=0, type=int, help="Linear warmup over warmup_steps.")
+
+    parser.add_argument("--warmup_proportion", default=0.1, type=float, 
+        help="Proportion of training to perform linear learning rate warmup for. E.g., 1/10 of training.")
 
     parser.add_argument("--logging_steps", type=int, default=500, help="Log every X updates steps.")
     parser.add_argument("--logging_steps_per_eval", type=int, default=10, help="Eval every X logging steps.")
@@ -551,7 +583,7 @@ def main():
 
     parser.add_argument(
         "--max_position",
-        default= 3072,
+        default= 2048,
         type=int,
         help="starting step",
     )
@@ -565,7 +597,7 @@ def main():
 
     parser.add_argument(
         "--seq_len",
-        default= 2048,
+        default= 1024,
         type=int,
         help="sequence length",
     )
@@ -642,11 +674,13 @@ def main():
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         args.n_gpu = torch.cuda.device_count()
+        args.n_gpu_used = args.n_gpu
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend="nccl")
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
         args.n_gpu = 1
+        args.n_gpu_used = dist.get_world_size()
     args.device = device
 
     if is_first_worker():
@@ -656,24 +690,14 @@ def main():
     dist.barrier()
 
     log_path = os.path.join(args.output_dir, "spam_{0}.log".format(str(dist.get_rank())))
-    fh = logging.FileHandler(log_path)
-    fh.setLevel(logging.DEBUG)
-    # create console handler with a higher log level
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
-    )
-    formatter = logging.Formatter(fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt="%m/%d/%Y %H:%M:%S")
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    logger = set_logger(log_path, args)
+
 
     logger.warning(
         "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
         args.local_rank,
         device,
-        args.n_gpu,
+        args.n_gpu_used,
         bool(args.local_rank != -1),
         args.fp16,
     )
@@ -687,12 +711,9 @@ def main():
 
     # Load pretrained model and tokenizer
     if args.local_rank not in [-1, 0]:
-        logger.info("the slaver process enter barrier")
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     config, tokenizer, model, configObj = load_model_config(args.model_type, args)
-
-    logger.info("-----------------------load config finished!!!------------------------------------------")
     
     if model.w:
         logger.info("Scale of sim-weight")
@@ -706,7 +727,6 @@ def main():
         configObj.check()
 
     if args.local_rank == 0:
-        logger.info("the main process enter barrier")
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     model.to(args.device)
@@ -715,18 +735,19 @@ def main():
 
     # Training
     if args.do_train:
-        train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+        train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu_used)
+        logger.info("per_gpu_train_batch_size: {} \t train_batch_size: {}".format(
+            args.per_gpu_train_batch_size, train_batch_size))
         train_fn = wrapped_process_fn(tokenizer, args, configObj)
 
         with LineShuffler(configObj.path) as f:
-            logger.info("start training: ---------------------")
-            global_step, tr_loss = train(args, model, tokenizer, f, train_fn, configObj)
+            global_step, tr_loss = train(args, model, tokenizer, f, train_fn, configObj, logger)
         
         # Good practice: save your training arguments together with the trained model
         if is_first_worker():
             logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
             logger.info("Saving model checkpoint to %s", args.output_dir)
-            save_checkpoint(args, -1, model, tokenizer)
+            save_checkpoint(args, -1, model, tokenizer, logger=logger)
             torch.save(args, os.path.join(args.output_dir, "training_args.bin"))
     dist.barrier()
     
@@ -744,9 +765,9 @@ def main():
         fidelity = eval_fidelity(args, model, eval_fn, eval_cfg.path, ideal_path, None, True, args.eval_full)
 
         if is_first_worker():
-            print("fidelity: {0}".format(str(fidelity)))
+            logger.info("fidelity: {0}".format(str(fidelity)))
     dist.barrier()
-    print("Exiting...")
+    logger.info("Exiting...")
 
     return results
 
