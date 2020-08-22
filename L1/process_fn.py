@@ -79,9 +79,10 @@ def L1_process_fn(line, i, tokenizer, args, col_map, cfg):
 
         label = 0
         if col_map["label"]>=0:
-            v = int(cells[col_map["label"]]) 
-            if v==1:
-                label = 1
+            label = int(cells[col_map["label"]])
+            # v = int(cells[col_map["label"]]) 
+            # if v==1:
+            #     label = 1
         features.append(label)
         if col_map["rating"]>=0:
             m = {"Perfect": 0, "Good": 2, "Fair": 3, "Excellent": 1, "Bad": 4}

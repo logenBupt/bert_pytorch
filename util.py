@@ -374,8 +374,8 @@ class LineShuffler:
             if line:
                 offset_map.append(offset)
             c+=1
-            # if c % 1000 == 0:
-            #     print(f"read {c} lines finished")
-            # if c > 10000:
-            #     break
+            if c % 1000000 == 0:
+                print(f"read {c} lines finished")
+            # if c > 100000:
+            #   break
         return offset_map

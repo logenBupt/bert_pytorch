@@ -285,11 +285,11 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj, logger):
         if m_epoch>0:
             shuffled_fh.change_seed(m_epoch)
         sds = SimplifiedStreamingDataset(shuffled_fh, train_fn, configObj.ix_func)
-        train_dataloader = DataLoader(sds, batch_size=args.per_gpu_train_batch_size, num_workers=4)
+        train_dataloader = DataLoader(sds, batch_size=args.per_gpu_train_batch_size, num_workers=1)
         acc_accum = []
         model.train()
         for step, batch in tqdm(enumerate(train_dataloader), desc="Iteration", disable=args.local_rank not in [-1, 0]):
-            if step % 100 == 0:
+            if step % 100 == 0 and step > 0:
                 logger.info('train_step: {}'.format(step))
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
@@ -332,10 +332,14 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj, logger):
                         loss.backward()
             tr_loss += loss.item()
 
+            if is_first_worker():
+                print("unique labels: ", torch.unique(inputs["labels"]).int())
+                print("Similarity combinations: ", sim_combine)
+
             for key, value in loss_combine.items():
-                tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value
+                tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value.item()
             for key, value in sim_combine.items():
-                tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value.mean()
+                tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value.mean().item()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
@@ -715,12 +719,12 @@ def main():
 
     config, tokenizer, model, configObj = load_model_config(args.model_type, args)
     
-    if model.w:
+    if model.sim_weight:
         logger.info("Scale of sim-weight")
         # logger.info("Model w:" + str(model.w.data))
         # logger.info("Model b:" + str(model.b.data))
-        logger.info("Model w:" + str(model.w))
-        logger.info("Model b:" + str(model.b))
+        logger.info("Model w:" + str(model.sim_weight))
+        logger.info("Model b:" + str(model.sim_bias))
 
     if is_first_worker():
         # check that train tsv exists

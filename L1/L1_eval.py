@@ -85,7 +85,7 @@ def eval_fidelity(args, model, fn, eval_path, ideal_path, data_cache_dir, is_fir
                 ratings = batch[8].unsqueeze(-1).cpu().numpy()
                 docids = batch[9].unsqueeze(-1).cpu().numpy()
                 output = model(**inputs)
-                sims = output[1]["eval"].detach().unsqueeze(-1).cpu().numpy()
+                sims = output[1]["Similarity/eval_sim"].detach().unsqueeze(-1).cpu().numpy()
                 assert sims.shape == ratings.shape
                 #t = torch.cat((qids, sims, ratings), dim=1)
                 t = np.concatenate((qids, sims, ratings, docids), axis=1)

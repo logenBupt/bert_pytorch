@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch_blocksparse import SparsityConfig, BertSparseSelfAttention, FixedSparsityConfig, DenseSparsityConfig, BigBirdSparsityConfig
 
 class BertDenseLN(nn.Module):
-    def __init__(self, config, outdim, num_hidden_layers, use_xavier=True, type="bert", p_dropout=0.0):
+    def __init__(self, config, num_hidden_layers, type="bert"):
         super().__init__()
         if type=="bert":
             self.bert = BertModel.from_pretrained("bert-base-multilingual-cased", num_hidden_layers=num_hidden_layers)
@@ -195,21 +195,20 @@ class L1_Original(BertPreTrainedModel):
     def __init__(self, config, model_argobj):
         super().__init__(config)
         self.args = model_argobj
-        self.q_encoder = BertDenseLN(config, 768, num_hidden_layers=3, use_xavier=False, p_dropout=0.1)
-        self.body_encoder = BertDenseLN(config, 768, num_hidden_layers=3, use_xavier=False, p_dropout=0.1)
+        self.q_encoder = BertDenseLN(config, num_hidden_layers=3)
+        self.body_encoder = BertDenseLN(config, num_hidden_layers=3)
         if model_argobj.enable_sparse_transformer:
             self.body_encoder.update_to_sparse_transformer(model_argobj.max_position, FixedSparsityConfig(model_argobj.num_heads, model_argobj.seq_len))
         self.q_encoder.bert.embeddings.word_embeddings = self.body_encoder.bert.embeddings.word_embeddings
+        self.dropout = nn.Dropout(p=0.1)
         self.sim_weight = 10.0
         self.sim_bias = -5.0
         # self.bce_logit_loss = nn.BCEWithLogitsLoss(pos_weight=torch.full([1], self.m_sample, dtype=torch.float32), reduction='none')
-        self.bce_logit_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
 
-        if args.use_MLP:
-            self.query_mlp = Compression(
-                config.hidden_size, args.compressor_dim)
-            self.meta_mlp = Compression(
-                config.hidden_size, args.compressor_dim)
+        if self.args.use_MLP:
+            self.query_mlp = Compression(config.hidden_size, self.args.compressor_dim)
+            self.meta_mlp = Compression(config.hidden_size, self.args.compressor_dim)
 
     def query_emb(self, input_ids, attention_mask):
         q_embs_norm = self.q_encoder(input_ids, attention_mask)
@@ -224,76 +223,83 @@ class L1_Original(BertPreTrainedModel):
         return body_embs_norm
     
     def forward(self, query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels):
-        labels = labels.float()
-        if not self.training:
-            return self.eval_forward(query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels)
-        
+        loss_label = torch.where(torch.eq(labels.int(), 1), labels, torch.zeros_like(labels).float())
+        loss_dict = {}
+        sim_dict = {}
         batch_size = query_ids.size(0)
         query_vectors = self.query_emb(query_ids, query_attn_mask)
         meta_vectors = self.body_emb(meta_ids, meta_attn_mask)
 
-        query_l2 = F.normalize(query_vectors, p=2, dim=-1)
-        query_sim = torch.matmul(query_l2, query_l2.T)
-        # query_mask = torch.where(torch.gt(query_sim, 0.90),
-        #                                  -1e12 * torch.ones_like(query_sim), torch.zeros_like(query_sim))
-        query_mask = (query_sim >= 0.9).float() * -1e12
-        # torch.where(condition, x, y) == x if conditon else y
-        
-        query_vectors = F.dropout(query_vectors, p=0.1, training=self.training)
-        meta_vectors = F.dropout(meta_vectors, p=0.1, training=self.training)
+        query_vectors = self.dropout(query_vectors)
+        meta_vectors = self.dropout(meta_vectors)
 
         src_norm = F.normalize(query_vectors, p=2, dim=-1)
         trg_norm = F.normalize(meta_vectors, p=2, dim=-1)
 
-        cross_sim = torch.matmul(src_norm, trg_norm.T)
-        cross_sim_masked = query_mask + -1e12 * torch.eye(batch_size).to(cross_sim.device) + cross_sim  # query_mask already contains torch.eye item
-        max_neg_idx = torch.argmax(cross_sim_masked, dim=1).detach()
-
-        neg_encoded_trg_norm = trg_norm[max_neg_idx]
-        src_norm_concat = torch.cat([src_norm, src_norm], dim=0)
-        trg_norm_concat = torch.cat([trg_norm, neg_encoded_trg_norm], dim=0)
-        t_labels = torch.cat((labels, torch.zeros_like(labels))).float()
-
-        t_sim = (src_norm_concat * trg_norm_concat).sum(-1)
-        t_logits = self.sim_weight * t_sim + self.sim_bias
-
-        per_sample_loss = self.bce_loss(t_logits, t_labels)
-        eval_loss = per_sample_loss[:batch_size].mean()
-        nce_loss = per_sample_loss[batch_size:].mean()
-        loss = self.args.nce_weight * nce_loss + (1.0 - self.args.nce_weight) * eval_loss
-        eval_sim = t_sim[:batch_size]
-        nce_sim = t_sim[batch_size:]
-
-        preds = (eval_sim >= 0.5).int()
-        acc = torch.eq(preds, labels.int()).float().mean()
-
-        label_0_sim = eval_sim[torch.eq(labels.int(), 0)]
-        label_1_sim = eval_sim[torch.eq(labels.int(), 1)]
-        label_2_sim = eval_sim[torch.eq(labels.int(), 2)]
-        label_3_sim = eval_sim[torch.eq(labels.int(), 3)]
-        label_4_sim = eval_sim[torch.eq(labels.int(), 4)]
-        label_5_sim = eval_sim[torch.eq(labels.int(), 5)]
-
-        # return loss, eval_loss, nce_loss, query_vectors, meta_vectors, eval_sim, nce_sim
-        return {"total_loss": loss, "eval_loss": (1.0 - self.args.nce_weight) * eval_loss, "nce_loss": self.args.nce_weight * nce_loss}, \
-            {"eval": eval_sim, "nce": nce_sim, "label_0": label_0_sim, "label_1": label_1_sim, "label_2": label_2_sim, "label_3": label_3_sim, "label_4": label_4_sim, "label_5": label_5_sim}, \
-                acc, query_vectors, meta_vectors
-
-    def eval_forward(self, query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels):
-        query_vectors = self.query_embs(query_ids, query_attn_mask)
-        meta_vectors = self.meta_embs(meta_ids, meta_attn_mask)
-
-        src_norm = F.normalize(query_vectors, p=2, dim=-1)
-        trg_norm = F.normalize(meta_vectors, p=2, dim=-1)
         eval_sim = (src_norm * trg_norm).sum(-1)
 
         eval_logits = self.sim_weight * eval_sim + self.sim_bias
-    
-        loss = self.bce_loss(eval_logits, labels.float()).mean()
-        
+        loss = self.bce_loss(eval_logits, loss_label.float()).mean()
+        eval_loss = loss
         preds = (eval_sim >= 0.5).int()
-        acc = torch.eq(preds, labels.int()).float().mean()
-        return {"total_loss": loss}, {"eval": eval_sim}, acc, query_vectors, meta_vectors
+        acc = torch.eq(preds, loss_label.int()).float().mean()
+
+        if self.training:
+
+            query_l2 = F.normalize(query_vectors, p=2, dim=-1)
+            query_sim = torch.matmul(query_l2, query_l2.T)
+            # query_mask = torch.where(torch.gt(query_sim, 0.90),
+            #                                  -1e12 * torch.ones_like(query_sim), torch.zeros_like(query_sim))
+            query_mask = (query_sim >= 0.9).float() * -1e12
+            # torch.where(condition, x, y) == x if conditon else y
+
+            cross_sim = torch.matmul(src_norm, trg_norm.T)
+            cross_sim_masked = query_mask + -1e12 * torch.eye(batch_size).to(cross_sim.device) + cross_sim  # query_mask already contains torch.eye item
+            max_neg_idx = torch.argmax(cross_sim_masked, dim=1).detach()
+
+            nce_trg_norm = trg_norm[max_neg_idx]
+            nce_labels = torch.zeros_like(labels).float()
+
+            nce_sim = (src_norm * nce_trg_norm).sum(-1)
+            nce_logits = self.sim_weight * nce_sim + self.sim_bias
+
+            nce_loss = self.bce_loss(nce_logits, loss_label.float()).mean()
+            loss = self.args.nce_weight * nce_loss + (1.0 - self.args.nce_weight) * eval_loss
+
+            preds = (eval_sim >= 0.5).int()
+            acc = torch.eq(preds, loss_label.int()).float().mean()
+
+            # sim_dict["sim/label_0_sim"] = eval_sim[torch.eq(labels.int(), 0)]
+            sim_dict["Similarity/label_1_sim"] = eval_sim[torch.eq(labels.int(), 1)]
+            # sim_dict["label_2_sim"] = eval_sim[torch.eq(labels.int(), 2)]
+            # sim_dict["label_3_sim"] = eval_sim[torch.eq(labels.int(), 3)]
+            sim_dict["Similarity/label_4_sim"] = eval_sim[torch.eq(labels.int(), 4)]
+            sim_dict["Similarity/label_5_sim"] = eval_sim[torch.eq(labels.int(), 5)]
+            sim_dict["Similarity/nce_sim"] = nce_sim
+
+            loss_dict["Loss/eval_loss"] = (1.0 - self.args.nce_weight) * eval_loss
+            loss_dict["Loss/nce_loss"] = self.args.nce_weight * nce_loss
+
+        loss_dict["Loss/total_loss"] = loss
+        sim_dict["Similarity/eval_sim"] = eval_sim
+
+        return loss_dict, sim_dict, acc, query_vectors, meta_vectors
+
+    # def eval_forward(self, query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels):
+    #     query_vectors = self.query_emb(query_ids, query_attn_mask)
+    #     meta_vectors = self.body_emb(meta_ids, meta_attn_mask)
+
+    #     src_norm = F.normalize(query_vectors, p=2, dim=-1)
+    #     trg_norm = F.normalize(meta_vectors, p=2, dim=-1)
+    #     eval_sim = (src_norm * trg_norm).sum(-1)
+
+    #     eval_logits = self.sim_weight * eval_sim + self.sim_bias
+    
+    #     loss = self.bce_loss(eval_logits, labels.float()).mean()
+        
+    #     preds = (eval_sim >= 0.5).int()
+    #     acc = torch.eq(preds, labels.int()).float().mean()
+    #     return {"total_loss": loss}, {"eval_sim": eval_sim}, acc, query_vectors, meta_vectors
 
 
 class L1_Orig_CLS(L1_Original):
