@@ -80,6 +80,7 @@ def L1_process_fn(line, i, tokenizer, args, col_map, cfg):
         label = 0
         if col_map["label"]>=0:
             label = int(cells[col_map["label"]])
+            # if label != 1:
             # v = int(cells[col_map["label"]]) 
             # if v==1:
             #     label = 1

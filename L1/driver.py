@@ -285,16 +285,16 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj, logger):
         if m_epoch>0:
             shuffled_fh.change_seed(m_epoch)
         sds = SimplifiedStreamingDataset(shuffled_fh, train_fn, configObj.ix_func)
-        train_dataloader = DataLoader(sds, batch_size=args.per_gpu_train_batch_size, num_workers=1)
+        train_dataloader = DataLoader(sds, batch_size=args.per_gpu_train_batch_size, num_workers=4, pin_memory=True)
         acc_accum = []
         model.train()
         for step, batch in tqdm(enumerate(train_dataloader), desc="Iteration", disable=args.local_rank not in [-1, 0]):
             if step % 100 == 0 and step > 0:
                 logger.info('train_step: {}'.format(step))
             # Skip past any already trained steps if resuming training
-            if steps_trained_in_current_epoch > 0:
-                steps_trained_in_current_epoch -= 1
-                continue
+            # if steps_trained_in_current_epoch > 0:
+            #     steps_trained_in_current_epoch -= 1
+            #     continue
           
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {"query_ids": batch[0].long(), "query_attn_mask": batch[1].long(), 
@@ -309,10 +309,10 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj, logger):
                     outputs = model(**inputs)
                     
             loss_combine = outputs[0]
-            assert len(loss_combine) == 3
-            loss = loss_combine["total_loss"]
+            # assert len(loss_combine) == 3
+            loss = loss_combine["Loss/total_loss"]
             sim_combine = outputs[1]
-            assert len(sim_combine) == 8
+            # assert len(sim_combine) == 8
             acc = outputs[2]
             acc_accum.append(acc.item())
 
@@ -332,14 +332,18 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj, logger):
                         loss.backward()
             tr_loss += loss.item()
 
-            if is_first_worker():
-                print("unique labels: ", torch.unique(inputs["labels"]).int())
-                print("Similarity combinations: ", sim_combine)
+            # if is_first_worker():
+                # print("unique labels: ", torch.unique(inputs["labels"]).int())
+            #    print("Similarity combinations: ", sim_combine)
 
             for key, value in loss_combine.items():
                 tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value.item()
             for key, value in sim_combine.items():
-                tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value.mean().item()
+                # print(f"{key}: {value.mean().item()}")
+                value = value.mean()
+                value[value != value] = 0
+                tensorboard_scalars[key] = tensorboard_scalars.setdefault(key, 0.0) + value.item()
+                # print(f"tensorboardscalars: {key} : {tensorboard_scalars[key]}")
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
@@ -353,11 +357,11 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj, logger):
                 global_step += 1
 
                 if args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    #for key, value in tensorboard_scalars.items():
+                    #    print(f"{key}: {value}")
                     if args.evaluate_during_training and global_step % (args.logging_steps_per_eval*args.logging_steps)==0:
                         if is_first_worker():
                             save_checkpoint(args, -1, model, tokenizer, logger=logger)
-
-                        logger.info("Train acc: {}".format(sum(acc_accum)*1.0/len(acc_accum)))                        
                         
                         model.eval()
                         is_first_eval = (eval_cnt == 0)
@@ -391,13 +395,15 @@ def train(args, model, tokenizer, shuffled_fh, train_fn, configObj, logger):
                         dist.barrier()
 
                     learning_rate_scalar = scheduler.get_lr()[0]
-
+                    avg_acc = sum(acc_accum)*1.0/len(acc_accum)
+                    logger.info("Train acc: {}".format(avg_acc))
                     if is_first_worker():
-                        tb_writer.add_scalar("learning_rate", learning_rate_scalar, global_step)
-                        tb_writer.add_scalar("epoch", m_epoch, global_step)
+                        tb_writer.add_scalar("Training/learning_rate", learning_rate_scalar, global_step)
+                        tb_writer.add_scalar("Training/epoch", m_epoch, global_step)
+                        tb_writer.add_scalar("Training/accuracy", avg_acc, global_step)
                         for key, value in tensorboard_scalars.items():
                             tb_writer.add_scalar(key, value / args.logging_steps, global_step)
-                        logger.info(json.dumps({**tensorboard_scalars, **{"step": global_step}}))
+                        logger.info(json.dumps({**tensorboard_scalars, **{"learning_rate": learning_rate_scalar, "Accuracy": avg_acc, "step": global_step}}))
                     
                     tensorboard_scalars = {}
                     dist.barrier()

@@ -10,8 +10,8 @@ from transformers import (
     XLMRobertaForSequenceClassification,
 )
 import torch.nn.functional as F
-from torch_blocksparse import SparsityConfig, BertSparseSelfAttention, FixedSparsityConfig, DenseSparsityConfig, BigBirdSparsityConfig
 from copy import deepcopy
+from torch_blocksparse import SparsityConfig, BertSparseSelfAttention, FixedSparsityConfig, DenseSparsityConfig, BigBirdSparsityConfig
 
 class BertDenseLN(nn.Module):
     def __init__(self, config, num_hidden_layers, type="bert"):
@@ -22,9 +22,6 @@ class BertDenseLN(nn.Module):
             config.num_hidden_layers = 3
             # self.bert = XLMRobertaModel.from_pretrained("xlm-roberta-base", num_hidden_layers=num_hidden_layers)
             self.bert = XLMRobertaModel(config)
-        elif type == "bert_sparse":
-            config.num_hidden_layers = 3
-            self.bert = BertModel(config)
         else:
             raise KeyError(f"{type} is not a valid type!")
 
@@ -200,9 +197,8 @@ class L1_Original(BertPreTrainedModel):
     def __init__(self, config, model_argobj):
         super().__init__(config)
         self.args = model_argobj
-        self.q_encoder = BertDenseLN(config, num_hidden_layers=3, type="bert_sparse")
-        body_config = deepcopy(config)
-        self.body_encoder = BertDenseLN(config, num_hidden_layers=3, type="bert_sparse")
+        self.q_encoder = BertDenseLN(config, num_hidden_layers=3)
+        self.body_encoder = BertDenseLN(config, num_hidden_layers=3)
         if model_argobj.enable_sparse_transformer:
             self.body_encoder.update_to_sparse_transformer(model_argobj.max_position, FixedSparsityConfig(model_argobj.num_heads, model_argobj.seq_len))
         self.q_encoder.bert.embeddings.word_embeddings = self.body_encoder.bert.embeddings.word_embeddings
@@ -227,36 +223,6 @@ class L1_Original(BertPreTrainedModel):
         if self.args.use_MLP:
             return self.query_mlp(body_embs_norm)
         return body_embs_norm
-
-    @classmethod
-    def from_pretrained(cls, model_path, config, model_argobj=None, from_tf=False):
-        final_path = ""
-        for sub_path in os.listdir(model_path):
-            if 'model' in sub_path:
-                final_path = os.path.join(model_path, sub_path)
-        if not final_path:
-           raise Exception("Can't find model file in path: {} {}".format(model_path, os.listdir(model_path)))
-        
-        model = cls(config, model_argobj)
-        ckpt = torch.load(final_path, map_location=lambda storage, loc: storage)
-        model_ckpt = ckpt['model'] if 'model' in ckpt else ckpt
-        
-        model.load_state_dict(model_ckpt, strict=False)
-        print("Init model from:", final_path)
-        # for name, var in model.named_parameters():
-        #     print(name, var.shape)
-        model.eval()
-        return model
-
-    def save_pretrained(self, save_directory):
-        assert os.path.isdir(
-            save_directory
-        ), "Saving path should be a directory where the model and configuration can be saved"
-        
-        # Only save the model itself if we are using distributed training
-        model_to_save = self.module if hasattr(self, "module") else self
-        output_model_file = os.path.join(save_directory, "pytorch_model.bin")
-        torch.save(model_to_save.state_dict(), output_model_file)
     
     def forward(self, query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels):
         labels = labels.float()
@@ -319,8 +285,6 @@ class L1_Original(BertPreTrainedModel):
 
         loss_dict["Loss/total_loss"] = loss
         sim_dict["Similarity/eval_sim"] = eval_sim
-
-        return loss_dict, sim_dict, acc, query_vectors, meta_vectors
 
     # def eval_forward(self, query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels):
     #     query_vectors = self.query_emb(query_ids, query_attn_mask)

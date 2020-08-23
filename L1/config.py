@@ -170,7 +170,7 @@ def load_model_config(model_type, args):
     #     model_argobj=model_args,
     # )
 
-    model = configObj.model_class(config, model_args)
+    model = configObj.model_class.from_pretrained(args.model_name_or_path, config, model_args)
 
     args.configObj = configObj
     args.eval_configObj = eval_config
