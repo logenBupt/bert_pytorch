@@ -9,6 +9,9 @@ from transformers import (
     XLMRobertaConfig,
 )
 from L1.process_fn import L1_process_fn, dual_ix_func, GetTrainingDataProcessingFn, GetTripletTrainingDataProcessingFn, L1_roberta_process_fn, L1_process_fn_exp
+from torch_blocksparse import SparsityConfig, BertSparseSelfAttention, FixedSparsityConfig, DenseSparsityConfig, BigBirdSparsityConfig
+from L1.tokenization import FullTokenizer
+from L1.bert_preprocess_fn import L1_bert_preprocess_fn
 
 # default_train_path = "/webdata-nfs/kwtang/L1_data/train_full.tsv"
 # cb_train_path_2 = "/webdata-nfs/lexion/L1_train/train_cb.shuf.tsv"
@@ -24,7 +27,7 @@ default_chunk_cfg = [[("query", "market"), (20, 5)], [("title", "anchor", "url",
 UTMB_Short_chunk_cfg = [[("query",), (20,)], [("url", "title", "desc", "cleanbody"),(20, 20, 50, 100)],]
 UTMB_chunk_cfg = [[("query", "market"), (20,5)], [("title", "url", "desc", "cleanbody"),(20, 20, 50, 300)],]
 
-Body_chunk_cfg = [[("query",), (20,)], [("cleanbody",), (1023,)]]
+Body_chunk_cfg = {"query": 20, "body": 1024,}
 
 train_schema_AUTCMLB = {"label": 0, "query" : 3, "title": 4, "anchor" : 5, "url" : 6, "click" : 7, "desc" : 8, "cleanbody" : 9, "market" : 10, "lang" : 11}
 eval_schema_AUTCMLB = {"qid" : 0, "docid" : 1, "query" : 4, "title" : 5, "anchor": 6, "url" : 7, "click" : 8, "desc" : 9, "rating" : 10, "cleanbody" : 11, "market" : 12, "lang" : 13}
@@ -66,6 +69,8 @@ class L1InputConfig:
 configs = [
     L1InputConfig(name = "l1_original",
                 model = L1_Original,
+                process_fn = L1_bert_preprocess_fn,
+                tokenizer_class = FullTokenizer,
                 chunk_cfg = Body_chunk_cfg,
                 ),
 
@@ -133,16 +138,17 @@ def load_model_config(model_type, args):
 
     eval_config = L1InputConfig("eval", configObj.model_class, 
                                 path = args.eval_path, 
-                                process_fn =  L1_process_fn, # we found using original proc fn in eval works the best, something pending more in depth study
+                                process_fn =  configObj.process_fn,
+                                tokenizer_class = configObj.tokenizer_class, # we found using original proc fn in eval works the best, something pending more in depth study
                                 chunk_cfg = configObj.chunk_cfg, 
                                 col_map = eval_schema_AUTCMLB)
 
     model_args = type('', (), {})()
     model_args.use_mean = configObj.use_mean
-    model_args.max_position = args.max_position
-    model_args.enable_sparse_transformer = args.enable_sparse_transformer
-    model_args.num_heads = args.num_heads
-    model_args.seq_len = args.seq_len
+    # model_args.max_position = args.max_position
+    # model_args.enable_sparse_transformer = args.enable_sparse_transformer
+    # model_args.num_heads = args.num_heads
+    # model_args.seq_len = args.seq_len
     model_args.use_MLP = False
     model_args.compressor_dim = 64
     model_args.nce_weight = 0.9
@@ -159,8 +165,8 @@ def load_model_config(model_type, args):
         #cache_dir=args.cache_dir if args.cache_dir else None,
     )
 
-    if args.enable_sparse_transformer:
-        tokenizer = update_tokenizer_model_max_length(tokenizer, args.max_position)
+    # if args.enable_sparse_transformer:
+    #     tokenizer = update_tokenizer_model_max_length(tokenizer, args.max_position)
 
     # model = configObj.model_class.from_pretrained(
     #     args.model_name_or_path,
@@ -170,8 +176,9 @@ def load_model_config(model_type, args):
     #     model_argobj=model_args,
     # )
 
-    model = configObj.model_class.from_pretrained(args.model_name_or_path, config, model_args)
-
+    model = configObj.model_class.from_pretrained(args.model_name_or_path, config=config, model_argobj=model_args)
+    if args.enable_sparse_transformer:
+        model.update_to_sparse_transformer(args.max_position, FixedSparsityConfig(args.num_heads, args.seq_len))
     args.configObj = configObj
     args.eval_configObj = eval_config
 

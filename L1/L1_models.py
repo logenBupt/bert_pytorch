@@ -200,12 +200,13 @@ class L1_Original(BertPreTrainedModel):
     def __init__(self, config, model_argobj):
         super().__init__(config)
         self.args = model_argobj
-        self.q_encoder = BertDenseLN(config, num_hidden_layers=3, type="bert_sparse")
-        body_config = deepcopy(config)
-        self.body_encoder = BertDenseLN(config, num_hidden_layers=3, type="bert_sparse")
-        if model_argobj.enable_sparse_transformer:
-            self.body_encoder.update_to_sparse_transformer(model_argobj.max_position, FixedSparsityConfig(model_argobj.num_heads, model_argobj.seq_len))
-        self.q_encoder.bert.embeddings.word_embeddings = self.body_encoder.bert.embeddings.word_embeddings
+        self.query = BertModel(config)
+        meta_config = deepcopy(config)
+        meta_config.type_vocab_size = 20
+        self.meta = BertModel(meta_config)
+        #if model_argobj.enable_sparse_transformer:
+        #    self.update_to_sparse_transformer(model_argobj.max_position, FixedSparsityConfig(model_argobj.num_heads, model_argobj.seq_len))
+        self.meta.embeddings.word_embeddings = self.query.embeddings.word_embeddings
         self.dropout = nn.Dropout(p=0.1)
         self.sim_weight = 10.0
         self.sim_bias = -5.0
@@ -216,47 +217,117 @@ class L1_Original(BertPreTrainedModel):
             self.query_mlp = Compression(config.hidden_size, self.args.compressor_dim)
             self.meta_mlp = Compression(config.hidden_size, self.args.compressor_dim)
 
+    
+    def extend_position_embedding(self, max_position):
+        """This function extends the position embedding weights of a model loaded from a checkpoint.
+        It assumes the new max position is bigger than the original max length.
+        Arguments:
+            model: required: a transformer model
+            max_position: required: an integer determining new position embedding size
+        Return:
+            model: updated model; in which position embedding weights have been extended based on new size
+        """
+
+        original_max_position = self.meta.embeddings.position_embeddings.weight.size(0)
+        assert max_position > original_max_position
+        extend_multiples = max(1, max_position // original_max_position)
+        embedding = nn.Embedding(max_position, self.meta.config.hidden_size)
+        embedding.weight = nn.Parameter(self.meta.embeddings.position_embeddings.weight.repeat(extend_multiples, 1))
+        # self.bert.embeddings.position_embeddings.weight.data = self.bert.embeddings.position_embeddings.weight.repeat(
+        #     extend_multiples, 1)
+        self.meta.embeddings.position_embeddings = embedding
+        self.meta.config.max_position_embeddings = max_position
+
+        print(f'Extended position embeddings to {original_max_position * extend_multiples}')
+
+    def replace_self_attention_layer_with_sparse_self_attention_layer(self, config, layers, sparsity_config=SparsityConfig(num_heads=4, seq_len=1024)):
+        """This function replaces the self attention layers in attention layer with sparse self attention.
+        For sparsityConfig, refer to the config class.
+        Arguments:
+            config: required: transformer model config
+            layers: required: transformer model attention layers
+            sparsity_config: optional: this parameter determins sparsity pattern configuration; it is based on SparsityConfig class
+        Return:
+            layers: updated attention layers; in which self attention layers have been repleaced with DeepSpeed Sparse Self Attention layer.
+        """
+
+        for layer in layers:
+            deepspeed_sparse_self_attn = BertSparseSelfAttention(config, sparsity_config)
+            deepspeed_sparse_self_attn.query = layer.attention.self.query
+            deepspeed_sparse_self_attn.key = layer.attention.self.key
+            deepspeed_sparse_self_attn.value = layer.attention.self.value
+            
+            layer.attention.self = deepspeed_sparse_self_attn
+
+
+    def replace_model_self_attention_with_sparse_self_attention(
+        self,
+        max_position,
+        # SparsityConfig parameters needs to be set accordingly
+        sparsity_config=SparsityConfig(num_heads=4,
+                                    seq_len=1024)):
+        """This function replaces the self attention layers in model encoder with sparse self attention.
+        It currently supports bert and roberta model and can be easily extended to any other models following similar steps here.
+        For sparsityConfig, refer to the config class.
+        Arguments:
+            model: required: a transformer model
+            max_position: required: an integer determining new position embedding size
+            sparsity_config: optional: this parameter determins sparsity pattern configuration; it is based on SparsityConfig class
+        Return:
+            model: updated model; in which self attention layer has been repleaced with DeepSpeed Sparse Self Attention layer.
+        """
+
+        self.meta.config.max_position_embeddings = max_position
+        self.replace_self_attention_layer_with_sparse_self_attention_layer(
+            self.meta.config,
+            self.meta.encoder.layer,
+            sparsity_config)
+
+    def update_to_sparse_transformer(self, max_position, sparsity_config=SparsityConfig(num_heads=4, seq_len=1024)):
+        self.extend_position_embedding(max_position)
+        self.replace_model_self_attention_with_sparse_self_attention(max_position, sparsity_config)
+
     def query_emb(self, input_ids, attention_mask):
-        q_embs_norm = self.q_encoder(input_ids, attention_mask)
+        q_embs_norm = self.query(input_ids, attention_mask)[1]
         if self.args.use_MLP:
             return self.query_mlp(q_embs_norm)
         return q_embs_norm
 
     def body_emb(self, input_ids, attention_mask):
-        body_embs_norm = self.body_encoder(input_ids, attention_mask)
+        body_embs_norm = self.meta(input_ids, attention_mask)[1]
         if self.args.use_MLP:
             return self.query_mlp(body_embs_norm)
         return body_embs_norm
 
-    @classmethod
-    def from_pretrained(cls, model_path, config, model_argobj=None, from_tf=False):
-        final_path = ""
-        for sub_path in os.listdir(model_path):
-            if 'model' in sub_path:
-                final_path = os.path.join(model_path, sub_path)
-        if not final_path:
-           raise Exception("Can't find model file in path: {} {}".format(model_path, os.listdir(model_path)))
+    # @classmethod
+    # def from_pretrained(cls, model_path, config, model_argobj=None, from_tf=False):
+    #     final_path = ""
+    #     for sub_path in os.listdir(model_path):
+    #         if 'model' in sub_path:
+    #             final_path = os.path.join(model_path, sub_path)
+    #     if not final_path:
+    #        raise Exception("Can't find model file in path: {} {}".format(model_path, os.listdir(model_path)))
         
-        model = cls(config, model_argobj)
-        ckpt = torch.load(final_path, map_location=lambda storage, loc: storage)
-        model_ckpt = ckpt['model'] if 'model' in ckpt else ckpt
+    #     model = cls(config, model_argobj)
+    #     ckpt = torch.load(final_path, map_location=lambda storage, loc: storage)
+    #     model_ckpt = ckpt['model'] if 'model' in ckpt else ckpt
         
-        model.load_state_dict(model_ckpt, strict=False)
-        print("Init model from:", final_path)
-        # for name, var in model.named_parameters():
-        #     print(name, var.shape)
-        model.eval()
-        return model
+    #     model.load_state_dict(model_ckpt, strict=False)
+    #     print("Init model from:", final_path)
+    #     # for name, var in model.named_parameters():
+    #     #     print(name, var.shape)
+    #     model.eval()
+    #     return model
 
-    def save_pretrained(self, save_directory):
-        assert os.path.isdir(
-            save_directory
-        ), "Saving path should be a directory where the model and configuration can be saved"
+    # def save_pretrained(self, save_directory):
+    #     assert os.path.isdir(
+    #         save_directory
+    #     ), "Saving path should be a directory where the model and configuration can be saved"
         
-        # Only save the model itself if we are using distributed training
-        model_to_save = self.module if hasattr(self, "module") else self
-        output_model_file = os.path.join(save_directory, "pytorch_model.bin")
-        torch.save(model_to_save.state_dict(), output_model_file)
+    #     # Only save the model itself if we are using distributed training
+    #     model_to_save = self.module if hasattr(self, "module") else self
+    #     output_model_file = os.path.join(save_directory, "pytorch_model.bin")
+    #     torch.save(model_to_save.state_dict(), output_model_file)
     
     def forward(self, query_ids, query_attn_mask, meta_ids, meta_attn_mask, labels):
         labels = labels.float()
